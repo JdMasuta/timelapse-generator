@@ -191,3 +191,33 @@ ffmpeg -y -f lavfi -i color=black:s=320x240 -frames:v 1 -c:v h264_nvenc nul
 ffmpeg -r 24 -f concat -safe 0 -i concat_list.txt -c:v libx264   -crf 15 -pix_fmt yuv420p -f null -
 ffmpeg -r 24 -f concat -safe 0 -i concat_list.txt -c:v h264_nvenc -rc vbr -cq 15 -b:v 0 -pix_fmt yuv420p -f null -
 ```
+
+---
+
+## Addendum — real-hardware validation (Win11, 8C/16T, working NVENC)
+
+Running `--benchmark` on the real `maximus_teardown` set (9,168 frames, 1080p)
+refined two things:
+
+1. **Cold vs warm decode.** The Phase-1 "decode ceiling" of ~78–82 fps was
+   **warm-cache** (those frames had already been read into the OS page cache by
+   earlier runs). The realistic **cold, one-pass** decode — every frame read
+   from disk exactly once, as in a real job — is far lower: **~17 fps** in the
+   container and **~12.6 fps** on the user's machine. So both machines are only
+   **~2–2.5× encode-bound on cold reads**, not 5–11×. The earlier ratios were an
+   artifact of measuring warm decode against (CPU-bound) encode.
+
+2. **NVENC works on the target box** (`h264_nvenc` initialized), which flips the
+   recommendation: because NVENC makes encode nearly free, total throughput
+   becomes the **parallel cold-decode** rate. A single NVENC stream would sit
+   decode-bound at ~12.6 fps (the exact "GPU idles waiting for decode" trap from
+   the brief) — so the win comes from **NVENC + parallel chunks**, which keep
+   several cold decoders feeding the GPU.
+
+**Tooling change:** `--benchmark` now reports the **cold** ceiling and measures
+**parallel decode scaling on fresh cold blocks** (never mixing cold/warm), and
+the recommendation keys off it. If cold parallel decode is flat, the run is
+I/O-bound (slow storage / antivirus per-file scan / OneDrive placeholders) and
+the tool says so and recommends fixing the source read before adding workers.
+(For `C:\Users\...\Downloads\...`, Windows Defender scanning each file open and
+OneDrive on-demand hydration are the usual suspects for a low cold ceiling.)

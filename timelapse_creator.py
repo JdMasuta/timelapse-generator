@@ -1019,6 +1019,55 @@ class TimelapseCreator:
     # Benchmark mode (decode ceiling vs full encode -> bottleneck verdict)
     # ------------------------------------------------------------------
 
+    def _sample_source_stats(self, sample) -> Tuple[str, float]:
+        """Return (WxH of the first readable frame, mean KiB/file over sample)."""
+        dims = "unknown"
+        for p, _ in sample:
+            if p.exists():
+                out = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-of", "csv=p=0:s=x", str(p)],
+                    capture_output=True, text=True)
+                if out.returncode == 0 and out.stdout.strip():
+                    dims = out.stdout.strip()
+                break
+        sizes = []
+        for p, _ in sample[:60]:
+            try:
+                sizes.append(p.stat().st_size)
+            except OSError:
+                pass
+        mean_kib = (sum(sizes) / len(sizes) / 1024) if sizes else 0.0
+        return dims, mean_kib
+
+    def _parallel_decode_fps(self, block, k: int) -> Optional[float]:
+        """Aggregate null-decode fps for `block` split across k processes.
+
+        Tells us whether the decode gate actually parallelizes on THIS machine
+        (CPU-bound / per-file-latency-bound decode scales with k; raw-disk-
+        bandwidth-bound decode stays flat). `block` should be a fresh, cold
+        slice so reads are not served from the page cache.
+        """
+        ranges = self._chunk_ranges(len(block), k)
+        procs, lists = [], []
+        t0 = time.perf_counter()
+        for i, (a, b) in enumerate(ranges):
+            lst = self.output_dir / f"bench_dec_{k}_{i}.txt"
+            self._write_chunk_list(block[a:b], lst)
+            lists.append(lst)
+            procs.append(subprocess.Popen(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                 "-f", "concat", "-safe", "0", "-i", str(lst), "-f", "null", "-"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        rc = [p.wait() for p in procs]
+        el = time.perf_counter() - t0
+        for lst in lists:
+            lst.unlink(missing_ok=True)
+        if any(rc) or not el:
+            return None
+        return len(block) / el
+
     def run_benchmark(self, presets: List[str], sample_frames: int = 200) -> bool:
         """Measure the decode ceiling vs full-encode fps and recommend settings.
 
@@ -1055,13 +1104,59 @@ class TimelapseCreator:
         print(f"BENCHMARK — decode ceiling vs full encode  (sample: {n} frames)")
         print("=" * 64)
 
-        self.logger.info("Stage throughput:")
-        decode = fps_of(inp + ["-f", "null", "-"], "decode only (ceiling)")
+        dims, mean_kib = self._sample_source_stats(sample)
+        self.logger.info(f"Source: {dims} px, mean {mean_kib:.0f} KiB/frame")
+
+        # NOTE on caching: the first read of each frame is cold (off disk); a
+        # real one-pass job reads every frame exactly once, so the COLD number
+        # is the realistic decode ceiling. Re-reads are served warm from the OS
+        # page cache and overstate one-pass throughput.
+        self.logger.info("Stage throughput (single process):")
+        decode = fps_of(inp + ["-f", "null", "-"],
+                        "decode only (cold, 1-pass ceiling)")
         fps_of(inp + ["-vf", "format=yuv420p", "-f", "null", "-"],
-               "decode + yuvj420p->yuv420p convert")
+               "decode + yuvj420p->yuv420p convert (warm)")
         if self.scale:
             fps_of(inp + ["-vf", f"scale={self._normalized_scale()}",
-                          "-f", "null", "-"], f"decode + scale {self.scale}")
+                          "-f", "null", "-"], f"decode + scale {self.scale} (warm)")
+
+        # Does the decode gate parallelize on THIS storage? This is the crux
+        # when decode is the gate -- e.g. NVENC makes encode ~free, so
+        # throughput becomes parallel decode throughput. Flat scaling =>
+        # I/O-bound (storage, not CPU). Each point uses a FRESH, previously-
+        # untouched block so reads are COLD (matching a real one-pass job).
+        # If there are not enough fresh frames for an all-cold series, fall back
+        # to a warm series (same sample for every k) and say so -- never MIX
+        # cold and warm points, which would give meaningless non-monotonic fps.
+        decode_points = sorted({1, max(2, self.physical_cores // 2),
+                                self.physical_cores})
+        cold_budget = len(self.ordered_files) - n
+        block = min(sample_frames, 160)
+        series_warm = cold_budget < block * len(decode_points)
+        if series_warm and cold_budget >= 24 * len(decode_points):
+            block = cold_budget // len(decode_points)   # smaller, still cold
+            series_warm = False
+        self.logger.info(
+            f"Parallel decode scaling "
+            f"({'WARM cache (CPU scaling only)' if series_warm else 'cold reads'}"
+            f", null encoder):")
+        decode_par, cursor = {}, n
+        for k in decode_points:
+            if series_warm:
+                blk = sample
+            else:
+                blk = self.ordered_files[cursor:cursor + block]
+                cursor += block
+            fps = self._parallel_decode_fps(blk, k)
+            decode_par[k] = fps
+            if fps:
+                base = decode_par.get(1) or fps
+                self.logger.info(
+                    f"  {k:2d} proc{'s' if k > 1 else ' '}: {fps:7.1f} fps "
+                    f"({fps / base:.2f}x vs 1)")
+        peak_decode = max((v for v in decode_par.values() if v), default=decode)
+        decode_scaling = ((peak_decode / decode_par[1])
+                          if decode_par.get(1) else 1.0)
 
         # GPU probe (presence != works).
         gpu_ok = self.probe_encoder("h264_nvenc")
@@ -1095,21 +1190,41 @@ class TimelapseCreator:
                 v = "MIXED"
             print(f"  {name:14s} {ratio:5.2f}x  -> {v}")
 
-        # Recommendation.
-        rec_workers = (min(self.config["nvenc_session_limit"],
-                           self.physical_cores) if gpu_ok else self.physical_cores)
+        # Recommendation, refined by whether the decode gate parallelizes.
+        decode_parallelizes = decode_scaling >= 1.5
         rec_encoder = "nvenc" if (gpu_ok and encode_bound_any) else "x264"
-        print("\nRecommendation:")
+        rec_workers = (min(self.config["nvenc_session_limit"], self.physical_cores)
+                       if rec_encoder == "nvenc" else self.physical_cores)
+        if not decode_parallelizes:
+            # Decode does not scale with processes -> storage/I/O is the gate.
+            rec_workers = min(rec_workers, max(2, self.physical_cores // 2))
+
+        print(f"\nParallel decode scaling: {decode_scaling:.2f}x "
+              f"(peak {peak_decode:.1f} fps at {self.physical_cores} procs)")
+        if series_warm:
+            print("  (scaling measured WARM — dataset too small for a cold test; "
+                  "this reflects CPU decode scaling, not cold-disk parallelism)")
+        print("Recommendation:")
         print(f"  --encoder {rec_encoder} --workers {rec_workers}")
-        if rec_encoder == "nvenc":
-            print("  (encode-bound + working NVENC: GPU offload is the biggest "
-                  "win; note the fidelity-per-bit tradeoff at low-CRF presets)")
+        if not decode_parallelizes:
+            print("  ** DECODE DOES NOT PARALLELIZE on this storage (flat scaling)")
+            print(f"     -> the pipeline is I/O-bound at ~{decode:.0f} fps; "
+                  f"--workers and even NVENC give limited gains.")
+            print("     Fix the source read first: move captures to a local "
+                  "NVMe/SSD folder, exclude it from antivirus (Defender scans")
+            print("     every file open), and ensure they are NOT OneDrive "
+                  "cloud-placeholders. Then re-run --benchmark.")
+        elif rec_encoder == "nvenc":
+            print(f"  Decode parallelizes ({decode_scaling:.1f}x) AND NVENC works:")
+            print(f"     NVENC takes encode off the CPU, so throughput rises "
+                  f"toward the parallel-decode ceiling (~{peak_decode:.0f} fps).")
+            print("     Fidelity-per-bit tradeoff is largest at construction "
+                  "(cq 10) / high_quality (cq 15); use x264 there if archival.")
         elif encode_bound_any:
-            print("  (encode-bound, no working GPU: parallel x264 chunks across "
-                  "physical cores)")
+            print("  Encode-bound, no working GPU: parallel x264 chunks across "
+                  "physical cores.")
         else:
-            print("  (decode-bound: parallel chunks parallelize decode across "
-                  "cores)")
+            print("  Decode-bound but scales: parallel chunks parallelize decode.")
         print("=" * 64)
 
         # Tidy up benchmark artifacts.

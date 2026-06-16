@@ -40,11 +40,21 @@ rate is corrected.
 | `--threads_per_worker N` | auto | x264 threads per worker (auto = `logical_cores // workers`, avoiding oversubscription). Ignored for NVENC. |
 | `--scale WxH` | none | Optional CPU downscale, e.g. `1280x720` (`-1` preserves aspect). Applied early to lighten every later stage. |
 | `--trust-manifest` | off | Skip per-file `exists()` checks (the manifest is authoritative); removes ~N `stat()` calls on large sets. |
-| `--benchmark` | off | Measure decode-ceiling vs full-encode fps on a sample, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`, then exit. |
+| `--benchmark` | off | Measure decode-ceiling vs full-encode fps, **plus cold parallel-decode scaling**, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`, then exit. |
 
 **Run `--benchmark` first** to get a verdict and recommended settings for *your*
 machine and dataset, then turn on speed with `--workers auto` (and `--encoder
 nvenc` if you have a working NVIDIA GPU).
+
+The benchmark reports the **cold** (first-read) decode ceiling — the realistic
+rate for a one-pass job, since every frame is read once — and separately
+measures whether decode **parallelizes across processes** using fresh cold
+blocks. This matters most with NVENC: the GPU makes encode nearly free, so total
+throughput becomes your *parallel cold-decode* rate. If parallel decode is flat,
+the pipeline is **I/O-bound** (slow storage, antivirus scanning each file open,
+or cloud-placeholder files) and `--workers`/NVENC give limited gains until the
+source read is fixed — the benchmark says so explicitly and recommends fewer
+workers.
 
 ### CRF → NVENC `-cq` mapping
 
