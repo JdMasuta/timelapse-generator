@@ -240,9 +240,24 @@ exposed three things the synthetic/CPU-only testing could not:
      the input side) so N concurrent decoders stop oversubscribing the CPU;
    - for high-res, **fewer NVENC sessions** (2–4) generally beat 8.
 
-3. **A correctness bug: 6 dropped frames at 20 fps (`construction`).** The
-   post-stitch seam check caught it and refused to stitch (working as designed),
-   but the cause was vsync dropping frames during rate handling. Fixed by
-   encoding every chunk and the single-process path with **`-fps_mode
-   passthrough`**, which passes each decoded frame through with its `-r`-derived
-   PTS — output frames now equal input frames by construction.
+3. **A correctness bug: frames dropped at chunk tails (`construction`).** The
+   post-stitch seam check caught it and refused to stitch (working as designed).
+   Two distinct causes, both now fixed:
+   - **vsync** could drop/dup frames during rate handling on any encoder — fixed
+     for all paths with **`-fps_mode passthrough`** (every decoded frame passes
+     through with its `-r`-derived PTS; verified frame-exact for x264).
+   - **NVENC specifically** still dropped **exactly 1 frame per chunk** even with
+     passthrough: B-frame reorder delay leaves the final reordered frame
+     unflushed in each MPEG-TS segment. Fixed with **`-bf 0`** (no B-frames →
+     no reorder delay → clean flush). Minor compression cost; archival should
+     use x264 anyway.
+
+4. **It is CPU-decode-bound even with NVENC.** With the GPU doing the encode, the
+   user observed **CPU pinned at 100% and the GPU underutilized** — 4K JPEG
+   decode saturates the CPU and starves the encoder. The measured benchmark bore
+   this out: `nvenc --workers 2` ≈ 18.8 fps (3.3× single x264) but `nvenc
+   --workers 8` ≈ 17.8 fps (no better — more sessions just contend for CPU
+   decode), and `x264 --workers 8` ≈ 6.8 fps (one x264 already maxes the CPU).
+   The decode gate is the JPEG → raw step on the CPU; the remaining lever is to
+   move decode off the CPU (GPU/NVDEC JPEG decode, experimental) or onto more/
+   faster cores.

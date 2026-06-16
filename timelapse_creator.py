@@ -159,7 +159,12 @@ class TimelapseCreator:
                 "construction": 10,
             },
             # NVENC quality/rate-control knobs shared by all presets.
-            "nvenc_common": ["-preset", "p5", "-tune", "hq",
+            # -bf 0 (no B-frames) is REQUIRED for the chunked path: B-frame
+            # reorder delay leaves the final reordered frame unflushed in each
+            # MPEG-TS segment, dropping ~1 frame per chunk (the seam check then
+            # fails). Disabling B-frames removes the reorder delay so every
+            # frame is emitted. Minor compression cost; use x264 for archival.
+            "nvenc_common": ["-preset", "p5", "-tune", "hq", "-bf", "0",
                              "-rc", "vbr", "-b:v", "0"],
             # Consumer GeForce concurrent NVENC session cap (driver 551.76+ = 8;
             # was 5, and 3 on older drivers). Never spawn more GPU sessions.

@@ -70,8 +70,10 @@ rate handling (this is enforced again by the post-stitch seam check).
 
 NVENC ignores `-crf`. Each preset's CRF is mapped 1:1 to NVENC `-cq` (same 0–51
 scale, lower = higher quality) under VBR with no bitrate cap (`-rc vbr -cq N
--b:v 0 -preset p5 -tune hq`). The mapping lives in one place
-(`config['nvenc_cq']` in `timelapse_creator.py`):
+-b:v 0 -preset p5 -tune hq -bf 0`). `-bf 0` (no B-frames) is required so the
+chunked MPEG-TS intermediates don't drop the final reordered frame of each
+segment. The mapping lives in one place (`config['nvenc_cq']` in
+`timelapse_creator.py`):
 
 | preset | framerate | x264 CRF | NVENC `-cq` |
 |---|---|---|---|
