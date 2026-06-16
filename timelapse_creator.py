@@ -669,11 +669,12 @@ class TimelapseCreator:
         # Never spawn more chunks than frames.
         workers = max(1, min(workers, n_files))
 
-        # Threads per worker.
+        # Per-worker CPU thread budget: split logical cores across workers so the
+        # concurrent JPEG decoders (and, for x264, the encoders) do not
+        # oversubscribe. Applies to GPU too -- there the budget caps the CPU-side
+        # MJPEG decode that feeds the encoder (see _chunk_encode_command).
         if self.threads_per_worker:
             threads = max(1, self.threads_per_worker)
-        elif is_gpu:
-            threads = 0  # let NVENC/decoder self-manage; chunks provide the //ism
         else:
             threads = max(1, self.logical_cores // workers)
 
@@ -709,14 +710,25 @@ class TimelapseCreator:
     ) -> List[str]:
         """ffmpeg command to encode one chunk to an intermediate segment."""
         preset = self.config["ffmpeg_presets"][preset_name]
+        is_gpu = self.config["encoders"][encoder_key]["kind"] == "gpu"
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                # Input framerate (see Phase 1 A): correct, frame-exact timing.
-               "-r", str(preset["framerate"]),
-               "-f", "concat", "-safe", "0", "-i", str(chunk_list)]
-        cmd += self._scale_filter_args()
-        cmd += self._video_codec_args(preset_name, encoder_key)
-        if threads:
+               "-r", str(preset["framerate"])]
+        # Cap DECODE threads on the INPUT side. Critical for GPU workers: N
+        # concurrent uncapped 4K MJPEG decoders oversubscribe the CPU and starve
+        # the encoder (the 8x-4K case that ran at 4 fps). x264's gate is its own
+        # encode threading, set on the output side below.
+        if threads and is_gpu:
             cmd += ["-threads", str(threads)]
+        cmd += ["-f", "concat", "-safe", "0", "-i", str(chunk_list)]
+        cmd += self._scale_filter_args()
+        # Never drop/duplicate frames: pass every decoded frame through with its
+        # (regular, -r-derived) PTS. Guarantees segment frames == input frames,
+        # which is what the seam check enforces.
+        cmd += ["-fps_mode", "passthrough"]
+        cmd += self._video_codec_args(preset_name, encoder_key)
+        if threads and not is_gpu:
+            cmd += ["-threads", str(threads)]   # x264 encode threads
         cmd += ["-f", self.config["intermediate_format"], str(segment)]
         return cmd
 
@@ -863,6 +875,8 @@ class TimelapseCreator:
             "-i", str(self.concat_list_path),
         ]
         cmd += self._scale_filter_args()
+        # Never drop/duplicate frames during rate handling (see chunk builder).
+        cmd += ["-fps_mode", "passthrough"]
         cmd += self._video_codec_args(preset_name, encoder_key)
         cmd += self._hevc_mp4_tag_args(encoder_key)
         cmd += ["-movflags", "+faststart", str(output_path)]
@@ -1068,6 +1082,41 @@ class TimelapseCreator:
             return None
         return len(block) / el
 
+    def _measure_encode_fps(self, block, workers: int, encoder_key: str,
+                            preset_name: str) -> Tuple[Optional[float], int]:
+        """Real chunked-encode wall-clock fps for `block` (encode only, no
+        stitch), plus the produced frame count.
+
+        This grounds the worker/encoder recommendation in measured throughput.
+        A decode-ceiling estimate alone badly over-predicts GPU at high
+        resolution: many concurrent 4K NVENC sessions contend instead of
+        scaling, so the measured number is the honest one.
+        """
+        ranges = self._chunk_ranges(len(block), workers)
+        threads = max(1, self.logical_cores // workers)
+        procs, arts = [], []
+        ext = self.config["intermediate_ext"]
+        t0 = time.perf_counter()
+        for i, (a, b) in enumerate(ranges):
+            cl = self.output_dir / f"bench_enc_{workers}_{i}.txt"
+            seg = self.output_dir / f"bench_enc_{workers}_{i}.{ext}"
+            self._write_chunk_list(block[a:b], cl)
+            arts.append((cl, seg))
+            cmd = self._chunk_encode_command(
+                cl, preset_name, encoder_key, seg, threads)
+            procs.append(subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        rc = [p.wait() for p in procs]
+        el = time.perf_counter() - t0
+        frames = sum(self._count_video_frames(seg)
+                     for _, seg in arts if seg.exists())
+        for cl, seg in arts:
+            cl.unlink(missing_ok=True)
+            seg.unlink(missing_ok=True)
+        if any(rc) or not el:
+            return None, 0
+        return len(block) / el, frames
+
     def run_benchmark(self, presets: List[str], sample_frames: int = 200) -> bool:
         """Measure the decode ceiling vs full-encode fps and recommend settings.
 
@@ -1165,7 +1214,8 @@ class TimelapseCreator:
             f"{'WORKS (runtime probe OK)' if gpu_ok else 'NOT USABLE here'}")
 
         verdicts = {}
-        self.logger.info("Full encode (x264) per preset:")
+        enc_fps_by_preset = {}
+        self.logger.info("Full encode (x264, single process) per preset:")
         for name in presets:
             preset = self.config["ffmpeg_presets"][name]
             out = self.output_dir / f"benchmark_{name}.mp4"
@@ -1174,9 +1224,10 @@ class TimelapseCreator:
                 + ["-c:v", "libx264", "-crf", str(preset["crf"]),
                    "-pix_fmt", "yuv420p", str(out)],
                 f"encode x264 {name} (crf {preset['crf']})")
-            if enc and decode:
-                ratio = decode / enc
-                verdicts[name] = ratio
+            if enc:
+                enc_fps_by_preset[name] = enc
+                if decode:
+                    verdicts[name] = decode / enc
 
         print("\nVerdict per preset (decode_ceiling / encode_fps):")
         encode_bound_any = False
@@ -1190,41 +1241,84 @@ class TimelapseCreator:
                 v = "MIXED"
             print(f"  {name:14s} {ratio:5.2f}x  -> {v}")
 
-        # Recommendation, refined by whether the decode gate parallelizes.
         decode_parallelizes = decode_scaling >= 1.5
-        rec_encoder = "nvenc" if (gpu_ok and encode_bound_any) else "x264"
-        rec_workers = (min(self.config["nvenc_session_limit"], self.physical_cores)
-                       if rec_encoder == "nvenc" else self.physical_cores)
-        if not decode_parallelizes:
-            # Decode does not scale with processes -> storage/I/O is the gate.
-            rec_workers = min(rec_workers, max(2, self.physical_cores // 2))
-
         print(f"\nParallel decode scaling: {decode_scaling:.2f}x "
               f"(peak {peak_decode:.1f} fps at {self.physical_cores} procs)")
         if series_warm:
             print("  (scaling measured WARM — dataset too small for a cold test; "
                   "this reflects CPU decode scaling, not cold-disk parallelism)")
-        print("Recommendation:")
-        print(f"  --encoder {rec_encoder} --workers {rec_workers}")
+
         if not decode_parallelizes:
-            print("  ** DECODE DOES NOT PARALLELIZE on this storage (flat scaling)")
-            print(f"     -> the pipeline is I/O-bound at ~{decode:.0f} fps; "
-                  f"--workers and even NVENC give limited gains.")
-            print("     Fix the source read first: move captures to a local "
-                  "NVMe/SSD folder, exclude it from antivirus (Defender scans")
-            print("     every file open), and ensure they are NOT OneDrive "
-                  "cloud-placeholders. Then re-run --benchmark.")
-        elif rec_encoder == "nvenc":
-            print(f"  Decode parallelizes ({decode_scaling:.1f}x) AND NVENC works:")
-            print(f"     NVENC takes encode off the CPU, so throughput rises "
-                  f"toward the parallel-decode ceiling (~{peak_decode:.0f} fps).")
-            print("     Fidelity-per-bit tradeoff is largest at construction "
-                  "(cq 10) / high_quality (cq 15); use x264 there if archival.")
-        elif encode_bound_any:
-            print("  Encode-bound, no working GPU: parallel x264 chunks across "
-                  "physical cores.")
+            # Decode does not scale with processes -> storage/I/O is the gate.
+            print("\n** DECODE DOES NOT PARALLELIZE on this storage (flat scaling)")
+            print(f"   -> I/O-bound at ~{decode:.0f} fps; --workers/NVENC give "
+                  f"limited gains. Fix the source read first (local NVMe/SSD,")
+            print("   exclude from antivirus, no OneDrive placeholders), then "
+                  "re-run --benchmark.")
+            print("Recommendation:")
+            print(f"  --encoder x264 --workers "
+                  f"{max(2, self.physical_cores // 2)}")
+            print("=" * 64)
+            for name in presets:
+                (self.output_dir / f"benchmark_{name}.mp4").unlink(missing_ok=True)
+            bench_list.unlink(missing_ok=True)
+            return True
+
+        # Measure REAL parallel-encode throughput. Decode-ceiling alone badly
+        # over-predicts GPU at high resolution (8x 4K NVENC sessions contend,
+        # not scale), so we time actual chunked encodes and recommend the
+        # measured winner. Use the heaviest (slowest x264) preset and a fresh
+        # cold block continuing past the decode-scaling cursor.
+        test_preset = (min(enc_fps_by_preset, key=enc_fps_by_preset.get)
+                       if enc_fps_by_preset else presets[0])
+        blk = self.ordered_files[cursor:cursor + min(sample_frames, 96)]
+        if len(blk) < 16:
+            blk = sample
+        cores = self.physical_cores
+
+        configs = [("x264", cores)]
+        if gpu_ok:
+            cap = min(self.config["nvenc_session_limit"], cores)
+            lo = max(2, cores // 4)
+            configs += [("nvenc", lo)]
+            if cap != lo:
+                configs += [("nvenc", cap)]
+
+        self.logger.info(
+            f"Measured parallel-encode throughput ({test_preset}, "
+            f"{len(blk)} frames):")
+        measured = []
+        for enc_key, w in configs:
+            w = min(w, len(blk))
+            fps, frames = self._measure_encode_fps(blk, w, enc_key, test_preset)
+            if fps:
+                drop = "" if frames == len(blk) else f"  !! {len(blk)-frames} dropped"
+                self.logger.info(
+                    f"  {enc_key:5s} x{w:<2d}: {fps:6.1f} fps{drop}")
+                measured.append((fps, enc_key, w))
+        # Single-process x264 is the baseline already measured above.
+        if enc_fps_by_preset.get(test_preset):
+            measured.append((enc_fps_by_preset[test_preset], "x264", 1))
+
+        print("\nRecommendation (measured):")
+        if measured:
+            best_fps, best_enc, best_w = max(measured, key=lambda x: x[0])
+            print(f"  --encoder {best_enc} --workers {best_w}    "
+                  f"(~{best_fps:.0f} fps on the {test_preset} preset)")
+            base = enc_fps_by_preset.get(test_preset, 0)
+            if base:
+                print(f"  vs single-process x264 ~{base:.0f} fps "
+                      f"({best_fps / base:.1f}x)")
+            if best_enc == "nvenc":
+                print("  NVENC trades fidelity-per-bit for speed and balloons "
+                      "file size at low cq (construction=10, high_quality=15);")
+                print("  use --encoder x264 for archival masters.")
+            elif gpu_ok:
+                print("  NVENC was available but did NOT beat x264 here (at this "
+                      "resolution concurrent GPU sessions contend) -> x264 wins.")
         else:
-            print("  Decode-bound but scales: parallel chunks parallelize decode.")
+            print(f"  --encoder x264 --workers {cores}  (encode measurement "
+                  f"unavailable; default to parallel x264)")
         print("=" * 64)
 
         # Tidy up benchmark artifacts.

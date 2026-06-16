@@ -47,14 +47,24 @@ machine and dataset, then turn on speed with `--workers auto` (and `--encoder
 nvenc` if you have a working NVIDIA GPU).
 
 The benchmark reports the **cold** (first-read) decode ceiling — the realistic
-rate for a one-pass job, since every frame is read once — and separately
-measures whether decode **parallelizes across processes** using fresh cold
-blocks. This matters most with NVENC: the GPU makes encode nearly free, so total
-throughput becomes your *parallel cold-decode* rate. If parallel decode is flat,
-the pipeline is **I/O-bound** (slow storage, antivirus scanning each file open,
-or cloud-placeholder files) and `--workers`/NVENC give limited gains until the
-source read is fixed — the benchmark says so explicitly and recommends fewer
-workers.
+rate for a one-pass job, since every frame is read once — measures whether
+decode **parallelizes across processes** (fresh cold blocks), and then **times
+real parallel encodes** (x264 across cores, plus NVENC at low and high worker
+counts) and recommends the **measured** winner. Measuring matters: a
+decode-ceiling estimate badly over-predicts NVENC at high resolution, where many
+concurrent 4K sessions *contend* on the GPU instead of scaling (8× 4K NVENC can
+be slower than single-process x264). If decode is flat the run is **I/O-bound**
+(slow storage / antivirus per-file scan / OneDrive placeholders) and the
+benchmark says so and recommends fixing the source read first.
+
+> **High-resolution + NVENC:** fewer concurrent sessions are usually faster.
+> NVENC throughput is per-GPU, not per-session, so 2–4 sessions typically
+> saturate the encoder while 8× 4K sessions just contend. Use `--benchmark` to
+> find the worker count that actually wins; don't assume more is better.
+
+Every encode uses ffmpeg `-fps_mode passthrough`, so output frame count is
+**exactly** the input frame count — no frames are dropped or duplicated during
+rate handling (this is enforced again by the post-stitch seam check).
 
 ### CRF → NVENC `-cq` mapping
 

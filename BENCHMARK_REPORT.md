@@ -216,8 +216,33 @@ refined two things:
 
 **Tooling change:** `--benchmark` now reports the **cold** ceiling and measures
 **parallel decode scaling on fresh cold blocks** (never mixing cold/warm), and
-the recommendation keys off it. If cold parallel decode is flat, the run is
-I/O-bound (slow storage / antivirus per-file scan / OneDrive placeholders) and
-the tool says so and recommends fixing the source read before adding workers.
-(For `C:\Users\...\Downloads\...`, Windows Defender scanning each file open and
-OneDrive on-demand hydration are the usual suspects for a low cold ceiling.)
+the recommendation keys off it.
+
+## Addendum 2 — 4K reality check (what the first real encode taught us)
+
+The first full run on the real data (3840×2160, **3.5 MiB/frame**, 9,168 frames)
+exposed three things the synthetic/CPU-only testing could not:
+
+1. **The low decode ceiling is CPU, not I/O.** Warm ≈ cold (12.3 ≈ 12.7 fps) on
+   a Windows Dev Drive — it is simply expensive to JPEG-decode 4K frames.
+   Decode *does* parallelize (5.6× at 8 procs), so the I/O-bound hypothesis was
+   wrong here; the gate is CPU decode + encode.
+
+2. **A decode-ceiling estimate over-predicts NVENC badly.** The benchmark
+   recommended `nvenc --workers 8` expecting ~77 fps; the real run managed
+   **4.2 fps** (slower than single-process x264) with a 4.4 GB file — 8
+   concurrent 4K NVENC sessions *contend* on the GPU rather than scale, and the
+   uncapped CPU-side decoders oversubscribed the cores. Fixes:
+   - the benchmark now **times real parallel encodes** (x264 across cores, NVENC
+     at low *and* high worker counts) and recommends the measured winner, so it
+     cannot over-promise NVENC again;
+   - GPU workers now get a **capped decode-thread budget** (`logical/workers` on
+     the input side) so N concurrent decoders stop oversubscribing the CPU;
+   - for high-res, **fewer NVENC sessions** (2–4) generally beat 8.
+
+3. **A correctness bug: 6 dropped frames at 20 fps (`construction`).** The
+   post-stitch seam check caught it and refused to stitch (working as designed),
+   but the cause was vsync dropping frames during rate handling. Fixed by
+   encoding every chunk and the single-process path with **`-fps_mode
+   passthrough`**, which passes each decoded frame through with its `-r`-derived
+   PTS — output frames now equal input frames by construction.
