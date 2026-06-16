@@ -40,7 +40,9 @@ rate is corrected.
 | `--threads_per_worker N` | auto | x264 threads per worker (auto = `logical_cores // workers`, avoiding oversubscription). Ignored for NVENC. |
 | `--scale WxH` | none | Optional CPU downscale, e.g. `1280x720` (`-1` preserves aspect). Applied early to lighten every later stage. |
 | `--trust-manifest` | off | Skip per-file `exists()` checks (the manifest is authoritative); removes ~N `stat()` calls on large sets. |
-| `--benchmark` | off | Measure decode-ceiling vs full-encode fps, **plus cold parallel-decode scaling**, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`, then exit. |
+| `--benchmark` | off | Measure decode-ceiling vs full-encode fps, **plus cold parallel-decode scaling** and **real parallel-encode throughput**, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`/`--hwdec`, then exit. |
+| `--hwdec` | off | **Experimental.** Decode JPEGs on the GPU (NVDEC `mjpeg_cuvid`) and keep frames on the GPU for NVENC — for when the pipeline is **CPU-decode-bound with an idle GPU** (the 4K case). Requires `--encoder nvenc`/`hevc_nvenc`; probed at runtime, falls back to CPU decode if it can't initialize. |
+| `--hwdec_workers N\|all` | `all` | With `--hwdec`, how many of the `--workers` chunks decode on the GPU; the rest decode on the CPU — the **hybrid** that balances decode across CPU + GPU. `--benchmark` suggests a value. |
 
 **Run `--benchmark` first** to get a verdict and recommended settings for *your*
 machine and dataset, then turn on speed with `--workers auto` (and `--encoder
@@ -97,12 +99,20 @@ list to reconcile across segments); the final MP4 gets `+faststart`. Seam
 integrity (final frame count == Σ chunk frames == input count) is verified after
 every chunked encode and aborts on mismatch.
 
-### Deliberately omitted: GPU JPEG decode
+### Experimental: GPU JPEG decode (`--hwdec`)
 
-NVDEC/`mjpeg_cuvid` for the concat-of-individual-JPEGs path is **not** used:
-per-file decoder init overhead and inconsistent MJPEG-on-NVDEC behavior make it
-fragile, and it could not be shown to help in profiling. CPU decode + parallel
-chunks is the workhorse. See BENCHMARK_REPORT.md §E.
+NVDEC/`mjpeg_cuvid` for the concat-of-individual-JPEGs path is **off by default**
+(per-file decoder init is fragile and MJPEG-on-NVDEC behavior varies). It is
+available as an opt-in because real 4K profiling showed the pipeline is
+**CPU-decode-bound with the GPU idle** — moving decode onto the GPU is then the
+biggest remaining lever. `--hwdec` decodes chunks on the GPU (frames never leave
+GPU memory, so no PCIe round-trip) and `--hwdec_workers N` runs a **hybrid**:
+`N` chunks decode on the GPU while the rest decode on the CPU, balancing the two.
+It is runtime-probed (a real `mjpeg_cuvid → nvenc` dry run on your frames) and
+falls back to CPU decode if it can't initialize; the post-stitch seam check
+still guarantees no dropped/duplicated frames. Use `--benchmark` to measure
+whether it helps and to get a suggested split. See BENCHMARK_REPORT.md §E and
+Addendum 2.
 
 ## Tests
 

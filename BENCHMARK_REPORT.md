@@ -258,6 +258,13 @@ exposed three things the synthetic/CPU-only testing could not:
    this out: `nvenc --workers 2` ≈ 18.8 fps (3.3× single x264) but `nvenc
    --workers 8` ≈ 17.8 fps (no better — more sessions just contend for CPU
    decode), and `x264 --workers 8` ≈ 6.8 fps (one x264 already maxes the CPU).
-   The decode gate is the JPEG → raw step on the CPU; the remaining lever is to
-   move decode off the CPU (GPU/NVDEC JPEG decode, experimental) or onto more/
-   faster cores.
+   The decode gate is the JPEG → raw step on the CPU.
+
+   This motivated the (otherwise deliberately-omitted) **`--hwdec`** path: move
+   JPEG decode onto the idle GPU (NVDEC `mjpeg_cuvid`) and keep frames on the GPU
+   for NVENC, with a **hybrid** option (`--hwdec_workers N`) that decodes `N`
+   chunks on the GPU and the rest on the CPU so both engines work. It is
+   runtime-probed on real frames (NVDEC MJPEG is fragile), falls back to CPU
+   decode, and the benchmark now measures it and suggests a split. This is the
+   one case the original brief carved out: NVDEC is justified *because* Phase-2
+   measurement showed a CPU-decode bottleneck with an idle GPU — not by default.

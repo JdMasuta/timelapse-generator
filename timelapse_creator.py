@@ -64,6 +64,8 @@ class TimelapseCreator:
         threads_per_worker: int = None,
         scale: str = None,
         trust_manifest: bool = False,
+        hwdec: bool = False,
+        hwdec_workers: str = "all",
     ):
         # Resolve paths relative to the script's location
         script_dir = Path(__file__).parent.resolve()
@@ -95,6 +97,9 @@ class TimelapseCreator:
         self.threads_per_worker = threads_per_worker
         self.scale = scale
         self.trust_manifest = trust_manifest
+        # EXPERIMENTAL hybrid GPU decode (see config['gpu_decode_*'])
+        self.hwdec = hwdec
+        self.hwdec_workers_arg = str(hwdec_workers)
 
         # Physical / logical core detection (cached) for worker auto-sizing
         self.logical_cores = os.cpu_count() or 1
@@ -174,6 +179,15 @@ class TimelapseCreator:
             # list to reconcile across segments) -- see BENCHMARK_REPORT.md C.
             "intermediate_format": "mpegts",
             "intermediate_ext": "ts",
+            # EXPERIMENTAL hybrid GPU-decode (--hwdec). When the pipeline is
+            # CPU-decode-bound with an idle GPU (the 4K case), some chunks decode
+            # on the GPU's NVDEC engine (mjpeg_cuvid) and encode on NVENC with
+            # the frames never leaving the GPU (no PCIe round-trip); the rest
+            # keep CPU decode. This balances decode across CPU + GPU. NVDEC MJPEG
+            # is fragile per-file, so it is opt-in, probed, and falls back.
+            "gpu_decode_decoder": "mjpeg_cuvid",
+            "gpu_decode_hwaccel": ["-hwaccel", "cuda",
+                                   "-hwaccel_output_format", "cuda"],
         }
 
         self.setup_logging()
@@ -543,6 +557,53 @@ class TimelapseCreator:
                     return ln
         return lines[-1] if lines else "(no error output)"
 
+    def probe_gpu_decode(self, sample_files) -> bool:
+        """Return True iff the GPU JPEG-decode -> NVENC pipeline initializes on
+        REAL frames (mjpeg_cuvid + cuda + h264_nvenc, frames staying on GPU).
+
+        Experimental: NVDEC MJPEG is fragile per-file, so this dry-runs the
+        actual concat path on a few real captures rather than trusting the
+        decoder list. Cached.
+        """
+        key = "gpu_decode"
+        if key in self._encoder_probe_cache:
+            return self._encoder_probe_cache[key]
+
+        files = [p for p, _ in sample_files[:4] if p.exists()]
+        if not files:
+            self._encoder_probe_cache[key] = False
+            return False
+
+        probe_list = self.output_dir / "hwdec_probe.txt"
+        with open(probe_list, "w", encoding="utf-8") as fh:
+            for p in files:
+                safe = str(p.resolve()).replace("\\", "/")
+                fh.write(f"file '{safe}'\n")
+        cmd = (["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+               + self.config["gpu_decode_hwaccel"]
+               + ["-c:v", self.config["gpu_decode_decoder"],
+                  "-f", "concat", "-safe", "0", "-i", str(probe_list),
+                  "-c:v", "h264_nvenc", "-bf", "0", "-f", "null", "-"])
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            ok = proc.returncode == 0
+            if not ok:
+                cause = self._extract_encoder_error(
+                    proc.stderr, self.config["gpu_decode_decoder"])
+                self.logger.warning(
+                    f"GPU decode (mjpeg_cuvid->nvenc) not usable: {cause}")
+        except subprocess.TimeoutExpired:
+            ok = False
+            self.logger.warning("GPU decode probe timed out")
+        except Exception as exc:
+            ok = False
+            self.logger.warning(f"GPU decode probe error: {exc}")
+        finally:
+            probe_list.unlink(missing_ok=True)
+
+        self._encoder_probe_cache[key] = ok
+        return ok
+
     def resolve_encoder(self, force: bool = False) -> Optional[str]:
         """Resolve the requested --encoder to a concrete, working encoder key.
 
@@ -593,11 +654,15 @@ class TimelapseCreator:
     # Encode planning: codec args, scale, framerate, workers, chunks
     # ------------------------------------------------------------------
 
-    def _video_codec_args(self, preset_name: str, encoder_key: str) -> List[str]:
+    def _video_codec_args(self, preset_name: str, encoder_key: str,
+                          gpu_frames: bool = False) -> List[str]:
         """Codec + quality args for a preset under the resolved encoder.
 
         The CRF->NVENC-cq mapping lives in config['nvenc_cq']. x264 uses CRF
-        directly (unchanged from prior behavior).
+        directly (unchanged from prior behavior). When `gpu_frames` is set
+        (NVDEC decode kept the frames in GPU memory) we must NOT force
+        `-pix_fmt yuv420p` -- that would trigger a hwdownload and defeat the
+        on-GPU pipeline; NVENC encodes the GPU NV12 frames to yuv420p directly.
         """
         preset = self.config["ffmpeg_presets"][preset_name]
         spec = self.config["encoders"][encoder_key]
@@ -610,14 +675,21 @@ class TimelapseCreator:
         # NVENC: -crf is ignored; map to -cq under VBR with no bitrate cap.
         cq = self.config["nvenc_cq"].get(preset_name, preset["crf"])
         args = ["-c:v", codec] + list(self.config["nvenc_common"])
-        args += ["-cq", str(cq), "-pix_fmt", "yuv420p"]
+        args += ["-cq", str(cq)]
+        if not gpu_frames:
+            args += ["-pix_fmt", "yuv420p"]
         return args
 
-    def _scale_filter_args(self) -> List[str]:
-        """Return ['-vf', 'scale=W:H'] if --scale was given, else []."""
+    def _scale_filter_args(self, gpu: bool = False) -> List[str]:
+        """Return ['-vf', 'scale=W:H'] if --scale was given, else [].
+
+        Uses the GPU `scale_cuda` filter when frames are already on the GPU
+        (the --hwdec path), CPU `scale` otherwise.
+        """
         if not self.scale:
             return []
-        return ["-vf", f"scale={self._normalized_scale()}"]
+        flt = "scale_cuda" if gpu else "scale"
+        return ["-vf", f"{flt}={self._normalized_scale()}"]
 
     def _normalized_scale(self) -> str:
         """Turn '1280x720' into ffmpeg's '1280:720' (accepts -1 for aspect)."""
@@ -685,6 +757,23 @@ class TimelapseCreator:
 
         return workers, threads
 
+    def _resolve_gpu_decode_count(self, workers: int) -> int:
+        """How many of `workers` chunks decode on the GPU (--hwdec).
+
+        'all'/'auto' -> every chunk (full-GPU decode); an integer -> that many
+        GPU-decode chunks and the rest CPU-decode (hybrid). Clamped to workers.
+        """
+        arg = self.hwdec_workers_arg
+        if arg in ("all", "auto"):
+            return workers
+        try:
+            k = int(arg)
+        except ValueError:
+            self.logger.warning(
+                f"Invalid --hwdec_workers '{arg}'; using all GPU-decode")
+            return workers
+        return max(0, min(k, workers))
+
     @staticmethod
     def _chunk_ranges(n: int, k: int) -> List[Tuple[int, int]]:
         """k contiguous, near-equal ranges covering [0, n) with no gaps."""
@@ -711,28 +800,39 @@ class TimelapseCreator:
 
     def _chunk_encode_command(
         self, chunk_list: Path, preset_name: str, encoder_key: str,
-        segment: Path, threads: int
+        segment: Path, threads: int, gpu_decode: bool = False
     ) -> List[str]:
-        """ffmpeg command to encode one chunk to an intermediate segment."""
+        """ffmpeg command to encode one chunk to an intermediate segment.
+
+        `gpu_decode` selects the experimental NVDEC path: the chunk's JPEGs are
+        decoded on the GPU (mjpeg_cuvid) and encoded by NVENC without leaving
+        GPU memory. The rest of the chunks decode on the CPU -- this is the
+        hybrid that balances decode across CPU + GPU.
+        """
         preset = self.config["ffmpeg_presets"][preset_name]
-        is_gpu = self.config["encoders"][encoder_key]["kind"] == "gpu"
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-               # Input framerate (see Phase 1 A): correct, frame-exact timing.
-               "-r", str(preset["framerate"])]
-        # Cap DECODE threads on the INPUT side. Critical for GPU workers: N
+        is_gpu_enc = self.config["encoders"][encoder_key]["kind"] == "gpu"
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        if gpu_decode:
+            # NVDEC JPEG decode; frames stay in GPU memory for NVENC.
+            cmd += self.config["gpu_decode_hwaccel"]
+            cmd += ["-c:v", self.config["gpu_decode_decoder"]]
+        # Input framerate (see Phase 1 A): correct, frame-exact timing.
+        cmd += ["-r", str(preset["framerate"])]
+        # Cap DECODE threads on the INPUT side for CPU-decoded NVENC chunks: N
         # concurrent uncapped 4K MJPEG decoders oversubscribe the CPU and starve
-        # the encoder (the 8x-4K case that ran at 4 fps). x264's gate is its own
-        # encode threading, set on the output side below.
-        if threads and is_gpu:
+        # the encoder (the 8x-4K case that ran at 4 fps). GPU-decoded chunks use
+        # NVDEC (no CPU threads); x264's gate is its own encode threading below.
+        if threads and is_gpu_enc and not gpu_decode:
             cmd += ["-threads", str(threads)]
         cmd += ["-f", "concat", "-safe", "0", "-i", str(chunk_list)]
-        cmd += self._scale_filter_args()
+        cmd += self._scale_filter_args(gpu=gpu_decode)
         # Never drop/duplicate frames: pass every decoded frame through with its
         # (regular, -r-derived) PTS. Guarantees segment frames == input frames,
         # which is what the seam check enforces.
         cmd += ["-fps_mode", "passthrough"]
-        cmd += self._video_codec_args(preset_name, encoder_key)
-        if threads and not is_gpu:
+        cmd += self._video_codec_args(preset_name, encoder_key,
+                                      gpu_frames=gpu_decode)
+        if threads and not is_gpu_enc:
             cmd += ["-threads", str(threads)]   # x264 encode threads
         cmd += ["-f", self.config["intermediate_format"], str(segment)]
         return cmd
@@ -775,21 +875,30 @@ class TimelapseCreator:
 
     def create_video_chunked(
         self, preset_name: str, encoder_key: str, workers: int, threads: int,
-        output_path: Path
+        output_path: Path, gpu_decode_count: int = 0
     ) -> bool:
         """Encode one preset via N concurrent chunks, then stitch + verify.
 
         Correctness: chunks are contiguous chronological ranges; the stitched
         output's frame count must equal the sum of chunk frames (== input
         count). Verified here and aborted on mismatch.
+
+        `gpu_decode_count` chunks decode on the GPU (NVDEC) and the rest on the
+        CPU -- the experimental hybrid. CPU-decode chunks get a larger thread
+        budget since the GPU-decode chunks barely touch the CPU.
         """
         n = len(self.ordered_files)
         ranges = self._chunk_ranges(n, workers)
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
 
+        cpu_workers = workers - gpu_decode_count
+        cpu_threads = (max(1, self.logical_cores // cpu_workers)
+                       if cpu_workers > 0 else threads)
+        split = (f", {gpu_decode_count} GPU-decode + {cpu_workers} CPU-decode"
+                 if gpu_decode_count else "")
         self.logger.info(
-            f"  Chunked encode: {workers} workers x {threads or 'auto'} threads, "
-            f"{n} frames -> chunks {[b - a for a, b in ranges]}")
+            f"  Chunked encode: {workers} workers x {threads or 'auto'} threads"
+            f"{split}, {n} frames -> chunks {[b - a for a, b in ranges]}")
 
         segments: List[Path] = []
         procs = []
@@ -799,8 +908,10 @@ class TimelapseCreator:
             chunk_list = self.chunks_dir / f"chunk_{preset_name}_{i:03d}.txt"
             segment = self.chunks_dir / f"seg_{preset_name}_{i:03d}.{ext}"
             self._write_chunk_list(self.ordered_files[a:b], chunk_list)
+            gpu_dec = i < gpu_decode_count
             cmd = self._chunk_encode_command(
-                chunk_list, preset_name, encoder_key, segment, threads)
+                chunk_list, preset_name, encoder_key, segment,
+                threads if gpu_dec else cpu_threads, gpu_decode=gpu_dec)
             procs.append((i, subprocess.Popen(cmd, stderr=subprocess.PIPE,
                                               text=True)))
             segments.append(segment)
@@ -949,6 +1060,9 @@ class TimelapseCreator:
             f"Encoder: {codec}  |  Workers: {workers}  |  "
             f"Threads/worker: {threads or 'auto'}")
 
+        gpu_decode_count = self._setup_hwdec(encoder_key, workers, dry_run) \
+            if self.hwdec else 0
+
         success_count = 0
         for preset_name in presets:
             if preset_name not in self.config["ffmpeg_presets"]:
@@ -962,16 +1076,17 @@ class TimelapseCreator:
 
             if dry_run:
                 self._dry_run_show(preset_name, encoder_key, workers, threads,
-                                   output_file, n_files)
+                                   output_file, n_files, gpu_decode_count)
                 success_count += 1
                 continue
 
             try:
-                if workers == 1:
+                if workers == 1 and gpu_decode_count == 0:
                     ok = self._encode_single(preset_name, encoder_key, output_file)
                 else:
                     ok = self.create_video_chunked(
-                        preset_name, encoder_key, workers, threads, output_file)
+                        preset_name, encoder_key, workers, threads, output_file,
+                        gpu_decode_count=gpu_decode_count)
                 if ok and output_file.exists():
                     size_mb = output_file.stat().st_size / (1024 * 1024)
                     self.logger.info(
@@ -1006,15 +1121,41 @@ class TimelapseCreator:
         self.logger.info(f"  Encoded in {elapsed:.1f}s")
         return True
 
+    def _setup_hwdec(self, encoder_key: str, workers: int,
+                     dry_run: bool) -> int:
+        """Validate + probe the experimental GPU-decode path; return the number
+        of chunks that should decode on the GPU (0 disables/falls back)."""
+        if self.config["encoders"][encoder_key]["kind"] != "gpu":
+            self.logger.error(
+                "--hwdec requires --encoder nvenc/hevc_nvenc (GPU encode); "
+                "ignoring --hwdec for this CPU encoder.")
+            return 0
+        if dry_run:
+            count = self._resolve_gpu_decode_count(workers)
+            self.logger.info(
+                f"DRY RUN: --hwdec would decode {count}/{workers} chunks on the "
+                f"GPU (mjpeg_cuvid), the rest on CPU (probe skipped in dry run)")
+            return count
+        if not self.probe_gpu_decode(self.ordered_files):
+            self.logger.warning(
+                "--hwdec requested but GPU JPEG decode (mjpeg_cuvid->nvenc) did "
+                "not initialize; falling back to CPU decode for all chunks.")
+            return 0
+        count = self._resolve_gpu_decode_count(workers)
+        self.logger.info(
+            f"--hwdec ENABLED: {count}/{workers} chunks decode on GPU (NVDEC), "
+            f"{workers - count} on CPU")
+        return count
+
     def _dry_run_show(
         self, preset_name: str, encoder_key: str, workers: int, threads: int,
-        output_file: Path, n_files: int
+        output_file: Path, n_files: int, gpu_decode_count: int = 0
     ) -> None:
         """Log the exact plan/command(s) a real run would execute."""
         def s(cmd):
             return " ".join(f'"{a}"' if " " in str(a) else str(a) for a in cmd)
 
-        if workers == 1:
+        if workers == 1 and gpu_decode_count == 0:
             cmd = self.generate_ffmpeg_command(
                 preset_name, output_filename=output_file.name,
                 encoder_key=encoder_key)
@@ -1022,14 +1163,22 @@ class TimelapseCreator:
         else:
             ranges = self._chunk_ranges(max(1, n_files), workers)
             ext = self.config["intermediate_ext"]
-            sample = self._chunk_encode_command(
-                self.chunks_dir / f"chunk_{preset_name}_000.txt", preset_name,
-                encoder_key, self.chunks_dir / f"seg_{preset_name}_000.{ext}",
-                threads)
             self.logger.info(
-                f"  DRY RUN [{workers}-way chunked + stitch]: "
-                f"chunk sizes {[b - a for a, b in ranges]}")
-            self.logger.info(f"    per-chunk (x{workers}): {s(sample)}")
+                f"  DRY RUN [{workers}-way chunked + stitch"
+                f"{f', {gpu_decode_count} GPU-decode' if gpu_decode_count else ''}"
+                f"]: chunk sizes {[b - a for a, b in ranges]}")
+            if gpu_decode_count:
+                gpu_cmd = self._chunk_encode_command(
+                    self.chunks_dir / f"chunk_{preset_name}_000.txt", preset_name,
+                    encoder_key, self.chunks_dir / f"seg_{preset_name}_000.{ext}",
+                    threads, gpu_decode=True)
+                self.logger.info(f"    GPU-decode chunk: {s(gpu_cmd)}")
+            if gpu_decode_count < workers:
+                cpu_cmd = self._chunk_encode_command(
+                    self.chunks_dir / f"chunk_{preset_name}_000.txt", preset_name,
+                    encoder_key, self.chunks_dir / f"seg_{preset_name}_000.{ext}",
+                    threads, gpu_decode=False)
+                self.logger.info(f"    CPU-decode chunk: {s(cpu_cmd)}")
             self.logger.info(
                 f"    stitch: ffmpeg -f concat -safe 0 -i stitch_list.txt "
                 f"-c copy -movflags +faststart {output_file}")
@@ -1088,14 +1237,17 @@ class TimelapseCreator:
         return len(block) / el
 
     def _measure_encode_fps(self, block, workers: int, encoder_key: str,
-                            preset_name: str) -> Tuple[Optional[float], int]:
+                            preset_name: str,
+                            gpu_decode_count: int = 0
+                            ) -> Tuple[Optional[float], int]:
         """Real chunked-encode wall-clock fps for `block` (encode only, no
         stitch), plus the produced frame count.
 
         This grounds the worker/encoder recommendation in measured throughput.
         A decode-ceiling estimate alone badly over-predicts GPU at high
         resolution: many concurrent 4K NVENC sessions contend instead of
-        scaling, so the measured number is the honest one.
+        scaling, so the measured number is the honest one. `gpu_decode_count`
+        chunks use the NVDEC path (the rest CPU decode).
         """
         ranges = self._chunk_ranges(len(block), workers)
         threads = max(1, self.logical_cores // workers)
@@ -1108,7 +1260,8 @@ class TimelapseCreator:
             self._write_chunk_list(block[a:b], cl)
             arts.append((cl, seg))
             cmd = self._chunk_encode_command(
-                cl, preset_name, encoder_key, seg, threads)
+                cl, preset_name, encoder_key, seg, threads,
+                gpu_decode=(i < gpu_decode_count))
             procs.append(subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         rc = [p.wait() for p in procs]
@@ -1281,46 +1434,75 @@ class TimelapseCreator:
             blk = sample
         cores = self.physical_cores
 
-        configs = [("x264", cores)]
+        # configs: (encoder_key, workers, gpu_decode_count)
+        configs = [("x264", cores, 0)]
         if gpu_ok:
             cap = min(self.config["nvenc_session_limit"], cores)
             lo = max(2, cores // 4)
-            configs += [("nvenc", lo)]
+            configs += [("nvenc", lo, 0)]
             if cap != lo:
-                configs += [("nvenc", cap)]
+                configs += [("nvenc", cap, 0)]
+            # Experimental GPU-decode (NVDEC): only if it initializes on real
+            # frames. Measures whether moving decode off the (maxed) CPU helps.
+            if self.probe_gpu_decode(sample):
+                self.logger.info("GPU decode (mjpeg_cuvid->nvenc) probe: OK")
+                gw = max(2, min(cap, cores // 2))
+                configs += [("nvenc", gw, gw)]            # full GPU decode
+                if gw >= 4:
+                    configs += [("nvenc", gw, gw // 2)]   # hybrid CPU+GPU decode
+            else:
+                self.logger.info(
+                    "GPU decode (mjpeg_cuvid) probe: not usable here -> "
+                    "skipping --hwdec measurement")
 
         self.logger.info(
             f"Measured parallel-encode throughput ({test_preset}, "
             f"{len(blk)} frames):")
         measured = []
-        for enc_key, w in configs:
+        for enc_key, w, gdc in configs:
             w = min(w, len(blk))
-            fps, frames = self._measure_encode_fps(blk, w, enc_key, test_preset)
+            gdc = min(gdc, w)
+            fps, frames = self._measure_encode_fps(
+                blk, w, enc_key, test_preset, gpu_decode_count=gdc)
             if fps:
-                drop = "" if frames == len(blk) else f"  !! {len(blk)-frames} dropped"
+                tag = (f" +hwdec({gdc})" if gdc else "")
+                drop = ("" if frames == len(blk)
+                        else f"  !! {len(blk) - frames} dropped (excluded)")
                 self.logger.info(
-                    f"  {enc_key:5s} x{w:<2d}: {fps:6.1f} fps{drop}")
-                measured.append((fps, enc_key, w))
-        # Single-process x264 is the baseline already measured above.
+                    f"  {enc_key}{tag} x{w}: {fps:6.1f} fps{drop}")
+                # Only recommend frame-exact configs (no drops).
+                if frames == len(blk):
+                    measured.append((fps, enc_key, w, gdc))
+        # Single-process x264 baseline (already measured above).
         if enc_fps_by_preset.get(test_preset):
-            measured.append((enc_fps_by_preset[test_preset], "x264", 1))
+            measured.append((enc_fps_by_preset[test_preset], "x264", 1, 0))
 
         print("\nRecommendation (measured):")
         if measured:
-            best_fps, best_enc, best_w = max(measured, key=lambda x: x[0])
-            print(f"  --encoder {best_enc} --workers {best_w}    "
+            best_fps, best_enc, best_w, best_gdc = max(
+                measured, key=lambda x: x[0])
+            if best_gdc and best_gdc == best_w:
+                hwdec = " --hwdec"                       # full GPU decode
+            elif best_gdc:
+                hwdec = f" --hwdec --hwdec_workers {best_gdc}"  # hybrid
+            else:
+                hwdec = ""
+            print(f"  --encoder {best_enc} --workers {best_w}{hwdec}    "
                   f"(~{best_fps:.0f} fps on the {test_preset} preset)")
             base = enc_fps_by_preset.get(test_preset, 0)
             if base:
                 print(f"  vs single-process x264 ~{base:.0f} fps "
                       f"({best_fps / base:.1f}x)")
+            if best_gdc:
+                print("  GPU decode (NVDEC) moved the decode bottleneck off the "
+                      "CPU -- the win for a CPU-decode-bound 4K pipeline.")
             if best_enc == "nvenc":
                 print("  NVENC trades fidelity-per-bit for speed and balloons "
-                      "file size at low cq (construction=10, high_quality=15);")
-                print("  use --encoder x264 for archival masters.")
+                      "file size at low cq (construction=10, high_quality=15); "
+                      "use --encoder x264 for archival masters.")
             elif gpu_ok:
-                print("  NVENC was available but did NOT beat x264 here (at this "
-                      "resolution concurrent GPU sessions contend) -> x264 wins.")
+                print("  NVENC did NOT beat x264 here (concurrent GPU sessions "
+                      "contend at this resolution) -> x264 wins.")
         else:
             print(f"  --encoder x264 --workers {cores}  (encode measurement "
                   f"unavailable; default to parallel x264)")
@@ -1353,6 +1535,7 @@ class TimelapseCreator:
             "physical_cores": self.physical_cores,
             "logical_cores": self.logical_cores,
             "scale": self.scale or "none",
+            "hwdec": (f"on ({self.hwdec_workers_arg})" if self.hwdec else "off"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1395,6 +1578,7 @@ class TimelapseCreator:
               f"-> {stats['encoder_resolved']}")
         print(f"Encode Workers:      {stats['encode_workers']} "
               f"(cores: {stats['physical_cores']}P/{stats['logical_cores']}L)")
+        print(f"GPU decode (hwdec):  {stats['hwdec']}")
         print(f"Scale:               {stats['scale']}")
         print(f"Manifest Threads:    {stats['max_workers']}")
         print(f"Display Timezone:    {stats['display_timezone']}")
@@ -1438,6 +1622,7 @@ Examples:
   python timelapse_creator.py --workers auto --presets high_quality
   python timelapse_creator.py --encoder auto --workers auto --trust-manifest
   python timelapse_creator.py --encoder nvenc --workers 6 --scale 1920x1080
+  python timelapse_creator.py --encoder nvenc --workers 4 --hwdec  (GPU decode)
 
 Speed/quality notes:
   * Default is single-process x264 (output matches prior runs; only the
@@ -1589,6 +1774,27 @@ Speed/quality notes:
         default=200,
         help="Frames sampled for --benchmark (default: 200)",
     )
+    parser.add_argument(
+        "--hwdec",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: decode JPEGs on the GPU (NVDEC mjpeg_cuvid) and keep "
+            "frames on the GPU for NVENC. Requires --encoder nvenc/hevc_nvenc. "
+            "Helps when the pipeline is CPU-decode-bound with an idle GPU (4K). "
+            "Probed at runtime; falls back to CPU decode if it can't initialize."
+        ),
+    )
+    parser.add_argument(
+        "--hwdec_workers",
+        default="all",
+        metavar="N|all",
+        help=(
+            "With --hwdec, how many of the --workers chunks decode on the GPU; "
+            "the rest decode on the CPU (the hybrid that balances decode across "
+            "CPU+GPU). 'all' = full GPU decode (default). Run --benchmark for a "
+            "measured suggestion."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1607,6 +1813,8 @@ Speed/quality notes:
             threads_per_worker=args.threads_per_worker,
             scale=args.scale,
             trust_manifest=args.trust_manifest,
+            hwdec=args.hwdec,
+            hwdec_workers=args.hwdec_workers,
         )
     except Exception as exc:
         print(f"Error initialising timelapse creator: {exc}")
