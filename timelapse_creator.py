@@ -585,7 +585,7 @@ class TimelapseCreator:
                   "-f", "concat", "-safe", "0", "-i", str(probe_list),
                   "-c:v", "h264_nvenc", "-bf", "0", "-f", "null", "-"])
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             ok = proc.returncode == 0
             if not ok:
                 cause = self._extract_encoder_error(
@@ -1264,8 +1264,39 @@ class TimelapseCreator:
                 gpu_decode=(i < gpu_decode_count))
             procs.append(subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        rc = [p.wait() for p in procs]
+
+        # Bounded wait: a hanging decoder (NVDEC MJPEG on 4K is fragile and CAN
+        # deadlock at scale) must never freeze the benchmark. Cap the whole
+        # config, kill stragglers, and report it as excluded rather than block
+        # forever (the 65-minute hang this replaces).
+        budget = max(90.0, len(block) * 2.0)
+        deadline = t0 + budget
+        timed_out = False
+        for p in procs:
+            try:
+                p.wait(timeout=max(1.0, deadline - time.perf_counter()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                break
         el = time.perf_counter() - t0
+        if timed_out:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            for p in procs:
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            for cl, seg in arts:
+                cl.unlink(missing_ok=True)
+                seg.unlink(missing_ok=True)
+            self.logger.warning(
+                f"    timed out >{int(budget)}s -> excluded "
+                f"(likely an unstable NVDEC/hwdec path on this footage)")
+            return None, 0
+
+        rc = [p.poll() for p in procs]
         frames = sum(self._count_video_frames(seg)
                      for _, seg in arts if seg.exists())
         for cl, seg in arts:
@@ -1442,15 +1473,17 @@ class TimelapseCreator:
             configs += [("nvenc", lo, 0)]
             if cap != lo:
                 configs += [("nvenc", cap, 0)]
-            # Experimental GPU-decode (NVDEC): only if it initializes on real
-            # frames. Measures whether moving decode off the (maxed) CPU helps.
-            if self.probe_gpu_decode(sample):
+            # Experimental GPU-decode (NVDEC) is measured ONLY when the user
+            # opts in with --hwdec: mjpeg_cuvid on 4K can deadlock at scale, so
+            # we never run it in the default benchmark. The bounded wait in
+            # _measure_encode_fps is the backstop if it does hang.
+            if self.hwdec and self.probe_gpu_decode(sample):
                 self.logger.info("GPU decode (mjpeg_cuvid->nvenc) probe: OK")
                 gw = max(2, min(cap, cores // 2))
                 configs += [("nvenc", gw, gw)]            # full GPU decode
                 if gw >= 4:
                     configs += [("nvenc", gw, gw // 2)]   # hybrid CPU+GPU decode
-            else:
+            elif self.hwdec:
                 self.logger.info(
                     "GPU decode (mjpeg_cuvid) probe: not usable here -> "
                     "skipping --hwdec measurement")
@@ -1462,14 +1495,15 @@ class TimelapseCreator:
         for enc_key, w, gdc in configs:
             w = min(w, len(blk))
             gdc = min(gdc, w)
+            tag = (f" +hwdec({gdc})" if gdc else "")
+            self.logger.info(f"  running {enc_key}{tag} x{w} ...")
             fps, frames = self._measure_encode_fps(
                 blk, w, enc_key, test_preset, gpu_decode_count=gdc)
             if fps:
-                tag = (f" +hwdec({gdc})" if gdc else "")
                 drop = ("" if frames == len(blk)
                         else f"  !! {len(blk) - frames} dropped (excluded)")
                 self.logger.info(
-                    f"  {enc_key}{tag} x{w}: {fps:6.1f} fps{drop}")
+                    f"    {enc_key}{tag} x{w}: {fps:6.1f} fps{drop}")
                 # Only recommend frame-exact configs (no drops).
                 if frames == len(blk):
                     measured.append((fps, enc_key, w, gdc))
@@ -1781,7 +1815,9 @@ Speed/quality notes:
             "EXPERIMENTAL: decode JPEGs on the GPU (NVDEC mjpeg_cuvid) and keep "
             "frames on the GPU for NVENC. Requires --encoder nvenc/hevc_nvenc. "
             "Helps when the pipeline is CPU-decode-bound with an idle GPU (4K). "
-            "Probed at runtime; falls back to CPU decode if it can't initialize."
+            "Probed at runtime; falls back to CPU decode if it can't initialize. "
+            "Combine with --benchmark to measure it (bounded; excluded if it "
+            "stalls)."
         ),
     )
     parser.add_argument(

@@ -40,7 +40,7 @@ rate is corrected.
 | `--threads_per_worker N` | auto | x264 threads per worker (auto = `logical_cores // workers`, avoiding oversubscription). Ignored for NVENC. |
 | `--scale WxH` | none | Optional CPU downscale, e.g. `1280x720` (`-1` preserves aspect). Applied early to lighten every later stage. |
 | `--trust-manifest` | off | Skip per-file `exists()` checks (the manifest is authoritative); removes ~N `stat()` calls on large sets. |
-| `--benchmark` | off | Measure decode-ceiling vs full-encode fps, **plus cold parallel-decode scaling** and **real parallel-encode throughput**, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`/`--hwdec`, then exit. |
+| `--benchmark` | off | Measure decode-ceiling vs full-encode fps, **plus cold parallel-decode scaling** and **real parallel-encode throughput**, print a decode-/encode-bound verdict + a recommended `--encoder`/`--workers`, then exit. Add `--hwdec` to *also* measure the experimental GPU-decode/hybrid paths (off by default since NVDEC-MJPEG can stall on 4K). |
 | `--hwdec` | off | **Experimental.** Decode JPEGs on the GPU (NVDEC `mjpeg_cuvid`) and keep frames on the GPU for NVENC — for when the pipeline is **CPU-decode-bound with an idle GPU** (the 4K case). Requires `--encoder nvenc`/`hevc_nvenc`; probed at runtime, falls back to CPU decode if it can't initialize. |
 | `--hwdec_workers N\|all` | `all` | With `--hwdec`, how many of the `--workers` chunks decode on the GPU; the rest decode on the CPU — the **hybrid** that balances decode across CPU + GPU. `--benchmark` suggests a value. |
 
